@@ -1,109 +1,147 @@
 import tkinter as tk
-from tkinter import ttk, Menu
+from tkinter import ttk
 import psutil
 import threading
 import time
+from pystray import Icon, Menu as TrayMenu, MenuItem as TrayItem
+from PIL import Image, ImageDraw
+
 
 class NetSpeedWidget:
     def __init__(self, root):
         self.root = root
-        self.root.title("📡 NetMonitor")
-        self.root.geometry("220x80")
-        self.root.resizable(False, False)
+        self.root.title("NetSpeed")
+        self.root.geometry("220x60")
+        self.root.overrideredirect(True)  # 🧱 Bez ramki
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.90)
+        self.root.attributes("-alpha", 0.9)
+        self.root.configure(bg="black")
 
-        # Styl
-        style = ttk.Style()
-        style.configure("TLabel", font=("Segoe UI", 10))
-
-        # Etykiety
-        self.label_down = ttk.Label(root, text="Pobieranie: -- Mbps")
-        self.label_down.pack(pady=(10, 0))
-
-        self.label_up = ttk.Label(root, text="Wysyłanie: -- Mbps")
-        self.label_up.pack()
-
-        # Interfejsy
+        # Dane sieciowe
         self.interfaces = list(psutil.net_if_stats().keys())
         self.selected_interface = tk.StringVar(value=self.interfaces[0])
 
-        # Menu
-        menubar = Menu(root)
-        settings_menu = Menu(menubar, tearoff=0)
+        # Widżety
+        self.label_down = tk.Label(root, text="↓ -- Mbps", fg="lime", bg="black", font=("Segoe UI", 10))
+        self.label_down.pack(pady=(5, 0))
 
-        interface_submenu = Menu(settings_menu, tearoff=0)
-        for iface in self.interfaces:
-            interface_submenu.add_radiobutton(label=iface, variable=self.selected_interface, value=iface, command=self.restart_monitoring)
+        self.label_up = tk.Label(root, text="↑ -- Mbps", fg="cyan", bg="black", font=("Segoe UI", 10))
+        self.label_up.pack()
 
-        settings_menu.add_cascade(label="Wybierz interfejs", menu=interface_submenu)
-        settings_menu.add_separator()
-        settings_menu.add_command(label="Start monitorowania", command=self.start_monitoring)
-        settings_menu.add_command(label="Zatrzymaj monitorowanie", command=self.stop)
-        settings_menu.add_separator()
-        settings_menu.add_command(label="Zamknij", command=self.close_app)
+        # Dane pomiarowe
+        self.running = True
+        self.prev_recv = 0
+        self.prev_sent = 0
+        self.prev_time = time.time()
 
-        menubar.add_cascade(label="Ustawienia", menu=settings_menu)
-        root.config(menu=menubar)
+        # Monitor w tle
+        threading.Thread(target=self.monitor_loop, daemon=True).start()
 
-        self.monitor_thread = None
-        self.running = False
+        # Tray
+        self.icon = None
+        threading.Thread(target=self.setup_tray, daemon=True).start()
 
-    def monitor(self, interface_name):
-        prev_recv = 0
-        prev_sent = 0
-        prev_time = time.time()
+        # Zamknięcie (ukrycie tylko)
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
 
+        # Przeciąganie
+        self.root.bind("<ButtonPress-1>", self.start_move)
+        self.root.bind("<B1-Motion>", self.do_move)
+
+    def monitor_loop(self):
         while self.running:
             try:
                 counters = psutil.net_io_counters(pernic=True)
-                if interface_name in counters:
+                iface = self.selected_interface.get()
+                if iface in counters:
                     now = time.time()
-                    stats = counters[interface_name]
+                    stats = counters[iface]
                     recv = stats.bytes_recv
                     sent = stats.bytes_sent
 
-                    if prev_recv != 0:
-                        delta_time = now - prev_time
-                        down_speed = (recv - prev_recv) * 8 / delta_time / 1_000_000
-                        up_speed = (sent - prev_sent) * 8 / delta_time / 1_000_000
+                    if self.prev_recv:
+                        delta = now - self.prev_time
+                        down = (recv - self.prev_recv) * 8 / delta / 1_000_000
+                        up = (sent - self.prev_sent) * 8 / delta / 1_000_000
 
-                        self.label_down.config(text=f"Pobieranie: {down_speed:.2f} Mbps")
-                        self.label_up.config(text=f"Wysyłanie: {up_speed:.2f} Mbps")
+                        self.label_down.config(text=f"↓ {down:.2f} Mbps")
+                        self.label_up.config(text=f"↑ {up:.2f} Mbps")
 
-                    prev_recv = recv
-                    prev_sent = sent
-                    prev_time = now
+                        if self.icon:
+                            self.icon.title = f"{iface} | ↓ {down:.1f} Mbps ↑ {up:.1f} Mbps"
+
+                    self.prev_recv = recv
+                    self.prev_sent = sent
+                    self.prev_time = now
 
                 time.sleep(1)
             except Exception as e:
                 self.label_down.config(text="Błąd")
                 self.label_up.config(text=str(e))
-                break
+                time.sleep(5)
 
-    def start_monitoring(self):
-        self.stop()
-        interface = self.selected_interface.get()
-        self.running = True
-        self.monitor_thread = threading.Thread(target=self.monitor, args=(interface,), daemon=True)
-        self.monitor_thread.start()
+    def setup_tray(self):
+        image = self.create_tray_icon()
 
-    def restart_monitoring(self):
-        if self.running:
-            self.start_monitoring()
+        # Menu interfejsów
+        iface_menu = TrayMenu(
+            *[TrayItem(
+                iface,
+                self.make_interface_selector(iface),
+                checked=lambda item, iface=iface: iface == self.selected_interface.get(),
+                radio=True
+            ) for iface in self.interfaces]
+        )
 
-    def stop(self):
+        # Tray menu
+        menu = TrayMenu(
+            TrayItem("Pokaż okno", self.show_window),
+            TrayItem("Wybierz interfejs", iface_menu),
+            TrayItem("Zamknij", self.quit_app)
+        )
+
+        self.icon = Icon("NetSpeed", image, "NetSpeed", menu)
+        self.icon.run()
+
+    def create_tray_icon(self):
+        # Ikonka – prosta zielona kreska
+        img = Image.new('RGB', (64, 64), color='black')
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([10, 26, 54, 38], fill='green')
+        return img
+
+    def make_interface_selector(self, iface):
+        def select(icon, item):
+            self.selected_interface.set(iface)
+            self.prev_recv = 0
+            self.prev_sent = 0
+        return select
+
+    def hide_window(self):
+        self.root.withdraw()
+
+    def show_window(self, icon=None, item=None):
+        self.root.deiconify()
+        self.root.attributes("-topmost", True)
+
+    def quit_app(self, icon=None, item=None):
         self.running = False
-        if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=1)
-
-    def close_app(self):
-        self.stop()
+        if self.icon:
+            self.icon.stop()
         self.root.destroy()
 
-# 🔌 Start
+    # Możliwość przeciągania okna myszką
+    def start_move(self, event):
+        self._x = event.x
+        self._y = event.y
+
+    def do_move(self, event):
+        x = event.x_root - self._x
+        y = event.y_root - self._y
+        self.root.geometry(f"+{x}+{y}")
+
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = NetSpeedWidget(root)
-    root.protocol("WM_DELETE_WINDOW", app.close_app)
     root.mainloop()
